@@ -38,6 +38,7 @@ function getActiveEvent() {
 const QUEST_GROUPS = {
   morning: {
     label: "아침 루틴", icon: "🌅", color: "#f59e0b", resource: "energy", bonusPts: 20, bonusRes: 5,
+    allowedEvents: ["morning_rush", "weekend_bonus"],
     tasks: [
       { id:"wake",      label:"⏰ 6시 기상",           pts:10, res:2 },
       { id:"brush_am",  label:"🦷 양치질",              pts:5,  res:1 },
@@ -49,6 +50,7 @@ const QUEST_GROUPS = {
   },
   homework: {
     label: "숙제 퀘스트", icon: "📚", color: "#3b82f6", resource: "knowledge", bonusPts: 20, bonusRes: 5,
+    allowedEvents: ["night_bonus", "weekend_bonus"],
     tasks: [
       { id:"hw_done",   label:"📝 학교 숙제 완료",       pts:20, res:4 },
       { id:"hw_check",  label:"✅ 숙제 다시 확인",       pts:10, res:2 },
@@ -57,6 +59,7 @@ const QUEST_GROUPS = {
   },
   study: {
     label: "추가 학습", icon: "🧠", color: "#6366f1", resource: "knowledge", bonusPts: 30, bonusRes: 8,
+    allowedEvents: ["night_bonus", "weekend_bonus"],
     tasks: [
       { id:"math",    label:"➕ 수학 20분",  pts:25, res:5 },
       { id:"english", label:"🔤 영어 20분",  pts:25, res:5 },
@@ -65,6 +68,7 @@ const QUEST_GROUPS = {
   },
   health: {
     label: "건강 퀘스트", icon: "💪", color: "#10b981", resource: "energy", bonusPts: 25, bonusRes: 6,
+    allowedEvents: ["morning_rush", "night_bonus", "weekend_bonus"],
     tasks: [
       { id:"exercise", label:"🏃 운동 30분",         pts:20, res:5 },
       { id:"lunch",    label:"🥗 균형 잡힌 점심",    pts:10, res:2 },
@@ -74,6 +78,7 @@ const QUEST_GROUPS = {
   },
   music: {
     label: "음악·창의", icon: "🎵", color: "#a855f7", resource: "talent", bonusPts: 20, bonusRes: 6,
+    allowedEvents: ["weekend_bonus"],
     tasks: [
       { id:"music_practice", label:"🎹 음악 연습 20분",   pts:20, res:6 },
       { id:"creative",       label:"🎨 창의 활동 10분",   pts:10, res:3 },
@@ -81,6 +86,7 @@ const QUEST_GROUPS = {
   },
   night: {
     label: "저녁 루틴", icon: "🌙", color: "#64748b", resource: "energy", bonusPts: 15, bonusRes: 4,
+    allowedEvents: ["night_bonus", "weekend_bonus"],
     tasks: [
       { id:"brush_pm", label:"🦷 저녁 양치",          pts:5,  res:1 },
       { id:"shower",   label:"🚿 샤워",               pts:10, res:2 },
@@ -226,6 +232,46 @@ const UPGRADES = {
   ],
 };
 
+// ─── GitHub API 동기화 ──────────────────────────────────
+// 설정: 관리자 모드에서 입력하거나 아래 직접 기재
+const GH_CONFIG_KEY = "dw_github_config";
+
+function loadGhConfig() {
+  try { const c = localStorage.getItem(GH_CONFIG_KEY); if (c) return JSON.parse(c); } catch {}
+  return { token:"", owner:"", repo:"", issueNumber:1 };
+}
+
+async function ghFetch(cfg, method, body) {
+  const { token, owner, repo, issueNumber } = cfg;
+  if (!token || !owner || !repo) throw new Error("GitHub 설정 없음");
+  const url = `https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/vnd.github+json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(`GitHub API 오류: ${res.status}`);
+  return res.json();
+}
+
+async function loadFromGitHub(ghCfg) {
+  const issue = await ghFetch(ghCfg, "GET");
+  const body = issue.body || "";
+  const match = body.match(/```json\n([\s\S]*?)\n```/);
+  if (!match) return null;
+  return JSON.parse(match[1]);
+}
+
+async function saveToGitHub(ghCfg, data) {
+  const json = JSON.stringify(data, null, 2);
+  const body = `<!-- 다크워 생존 일지 데이터 저장소 -->\n\`\`\`json\n${json}\n\`\`\``;
+  await ghFetch(ghCfg, "PATCH", { body });
+}
+
 // ─── localStorage 키 ────────────────────────────────────
 const KEY = "dw_advanced_v1";
 
@@ -240,14 +286,15 @@ function initState() {
   return {
     points: 0,
     resources: { energy:0, knowledge:0, talent:0 },
-    completedByDay: {},         // { "2025-01-01": ["wake","brush",...] }
-    skillLevels: {},            // { "math": 2, "life": 1, ... }
-    skillProgress: {},          // { "math": [true,false,...] } mission completion per level
-    weeklySkillUps: {},         // { "2025-W1": 2 } 이번 주 올린 스킬 수
-    upgrades: {},               // { "upg_yt_30to45": true }
-    weeklyBoosts: {},           // { "2025-W1": ["upg_math_ease"] }
+    completedByDay: {},
+    skillLevels: {},
+    skillProgress: {},
+    weeklySkillUps: {},
+    upgrades: {},
+    weeklyBoosts: {},
     totalPts: 0,
     history: [],
+    rewardInventory: {},
   };
 }
 
@@ -258,6 +305,12 @@ function initState() {
 const ADMIN_PW = "1234"; // ← 비밀번호 여기서 변경
 
 function App() {
+  // GitHub 설정
+  const [ghCfg, setGhCfg] = useState(loadGhConfig);
+  const [syncStatus, setSyncStatus] = useState("idle"); // idle | loading | saving | ok | error
+  const [syncMsg, setSyncMsg] = useState("");
+
+  // 앱 데이터
   const [state, setState] = useState(() => {
     try { const s = localStorage.getItem(KEY); if (s) return JSON.parse(s); } catch {}
     return initState();
@@ -274,7 +327,7 @@ function App() {
   const [adminPwError, setAdminPwError] = useState(false);
   const [showAdminLogin, setShowAdminLogin] = useState(false);
 
-  // 앱 설정 (편집 가능한 데이터 — localStorage에 별도 저장)
+  // 앱 설정
   const CFG_KEY = "dw_config_v1";
   const [cfg, setCfg] = useState(() => {
     try {
@@ -290,9 +343,58 @@ function App() {
     };
   });
 
+  // ── localStorage 캐시 (오프라인 백업용) ──
+  useEffect(() => {
+    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch {}
+  }, [state]);
+
   useEffect(() => {
     try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch {}
   }, [cfg]);
+
+  // ── GitHub에서 초기 로딩 ──
+  useEffect(() => {
+    if (!ghCfg.token || !ghCfg.owner || !ghCfg.repo) return;
+    setSyncStatus("loading");
+    setSyncMsg("GitHub에서 데이터 불러오는 중...");
+    loadFromGitHub(ghCfg).then(data => {
+      if (data) {
+        if (data.state) setState(data.state);
+        if (data.cfg)   setCfg(data.cfg);
+        setSyncStatus("ok");
+        setSyncMsg("동기화 완료 ✅");
+      } else {
+        setSyncStatus("ok");
+        setSyncMsg("새 데이터로 시작해요");
+      }
+    }).catch(err => {
+      setSyncStatus("error");
+      setSyncMsg("불러오기 실패: " + err.message);
+    });
+  }, [ghCfg.token, ghCfg.owner, ghCfg.repo, ghCfg.issueNumber]);
+
+  // ── GitHub에 자동 저장 (state/cfg 변경 후 2초 디바운스) ──
+  useEffect(() => {
+    if (!ghCfg.token || !ghCfg.owner || !ghCfg.repo) return;
+    if (syncStatus === "loading") return;
+    const timer = setTimeout(() => {
+      setSyncStatus("saving");
+      setSyncMsg("저장 중...");
+      saveToGitHub(ghCfg, { state, cfg }).then(() => {
+        setSyncStatus("ok");
+        setSyncMsg("저장됨 ✅ " + new Date().toLocaleTimeString("ko-KR"));
+      }).catch(err => {
+        setSyncStatus("error");
+        setSyncMsg("저장 실패: " + err.message);
+      });
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [state, cfg]);
+
+  function saveGhCfg(next) {
+    setGhCfg(next);
+    try { localStorage.setItem(GH_CONFIG_KEY, JSON.stringify(next)); } catch {}
+  }
 
   function updateCfg(path, value) {
     setCfg(prev => {
@@ -339,10 +441,6 @@ function App() {
   const activeEvent = getActiveEventFromCfg();
   const completed = state.completedByDay[today] || [];
 
-  useEffect(() => {
-    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch {}
-  }, [state]);
-
   function showToast(msg, type="success") {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 2800);
@@ -351,16 +449,19 @@ function App() {
   // 오늘 모든 태스크 목록 (cfg 기반)
   const allTasks = Object.values(cfg.questGroups).flatMap(g => g.tasks);
 
-  // 포인트 배율
-  function getMultiplier() {
+  // 포인트 배율 — 카테고리별 허용 이벤트만 적용
+  function getMultiplierForGroup(groupKey) {
+    const group = cfg.questGroups[groupKey];
+    const allowed = group.allowedEvents || [];
     if (!activeEvent) return 1;
+    if (!allowed.includes(activeEvent.id)) return 1;
     return activeEvent.mult;
   }
 
   // 태스크 토글
   function toggleTask(groupKey, taskId, pts, res, resource) {
     const already = completed.includes(taskId);
-    const mult = already ? 1 : getMultiplier();
+    const mult = already ? 1 : getMultiplierForGroup(groupKey);
     const earnedPts = Math.round(pts * mult);
     const earnedRes = Math.round(res * mult);
     const diff = already ? -pts : earnedPts;
@@ -481,12 +582,13 @@ function App() {
   function confirmRedeem() {
     const { reward, tier } = modal;
     setState(s => {
+      const newInv = { ...s.rewardInventory, [reward.id]: ((s.rewardInventory||{})[reward.id]||0) + 1 };
       if (tier < 3) {
-        return { ...s, points: s.points - reward.pts };
+        return { ...s, points: s.points - reward.pts, rewardInventory: newInv };
       } else {
         const newRes = { ...s.resources };
         Object.entries(reward.res).forEach(([r,v]) => { newRes[r]=Math.max(0,(newRes[r]||0)-v); });
-        return { ...s, resources:newRes };
+        return { ...s, resources:newRes, rewardInventory: newInv };
       }
     });
     setModal(null);
@@ -512,6 +614,34 @@ function App() {
               todayMax={todayMax} activeEvent={activeEvent}
               onAdminClick={()=>adminMode?setAdminMode(false):setShowAdminLogin(true)}
               adminMode={adminMode} />
+
+      {/* ── 동기화 상태 바 ── */}
+      {ghCfg.token && ghCfg.owner && ghCfg.repo && (
+        <div style={{
+          background: syncStatus==="error" ? "#2d0a0a"
+                    : syncStatus==="saving" ? "#0a1a2e"
+                    : syncStatus==="loading" ? "#0a1a2e"
+                    : "#0a1a0a",
+          borderBottom: `1px solid ${syncStatus==="error"?"#7f1d1d":syncStatus==="ok"?"#14532d":"#1e3a5f"}`,
+          padding:"4px 14px", display:"flex", alignItems:"center", gap:8,
+        }}>
+          <span style={{ fontSize:10 }}>
+            {syncStatus==="loading"?"⏳":syncStatus==="saving"?"💾":syncStatus==="error"?"❌":"✅"}
+          </span>
+          <span style={{ fontSize:10, color: syncStatus==="error"?"#f87171":syncStatus==="ok"?"#34d399":"#60a5fa" }}>
+            {syncMsg || "GitHub 연동됨"}
+          </span>
+        </div>
+      )}
+      {!ghCfg.token && (
+        <div style={{ background:"#1a1000", borderBottom:"1px solid #78350f",
+                      padding:"4px 14px", display:"flex", alignItems:"center", gap:8 }}>
+          <span style={{ fontSize:10 }}>⚠️</span>
+          <span style={{ fontSize:10, color:"#fbbf24" }}>
+            GitHub 미연동 — 관리자 → GitHub 설정에서 연결하세요
+          </span>
+        </div>
+      )}
 
       {/* ── 자원 바 ── */}
       <ResourceBar resources={state.resources} />
@@ -572,12 +702,14 @@ function App() {
                     <div style={{ paddingLeft:8, marginTop:4, display:"flex", flexDirection:"column", gap:5 }}>
                       {group.tasks.map(task=>{
                         const done = completed.includes(task.id);
-                        const mult = !done && activeEvent ? activeEvent.mult : 1;
+                        const mult = !done ? getMultiplierForGroup(gKey) : 1;
+                        const allowed = group.allowedEvents || [];
 
-                        // 이 태스크에 적용되는 모든 이벤트 (현재 + 예정 모두)
+                        // 이 카테고리에 허용된 이벤트만 뱃지로 표시
                         const isWeekend = new Date().getDay()===0||new Date().getDay()===6;
                         const applicableEvents = cfg.eventTimes.filter(ev=>
-                          ev.days==="all" || (ev.days==="weekend" && isWeekend)
+                          allowed.includes(ev.id) &&
+                          (ev.days==="all" || (ev.days==="weekend" && isWeekend))
                         );
 
                         return (
@@ -757,13 +889,22 @@ function App() {
                         .filter(([,v])=>v>0)
                         .map(([r,v])=>`${RESOURCE_TYPES[r].icon}${v}`).join(" ");
                     }
+                    const ownedCount = (state.rewardInventory||{})[reward.id] || 0;
                     return (
                       <button key={reward.id} onClick={()=>redeemReward(reward,tier.tier)}
-                        style={{ padding:"14px 10px",borderRadius:12,
+                        style={{ padding:"14px 10px",borderRadius:12, position:"relative",
                                  border:`1px solid ${canAfford?tier.color+"70":"#1e293b"}`,
                                  background:canAfford?tier.color+"12":"#131e30",
                                  cursor:canAfford?"pointer":"not-allowed",
                                  opacity:canAfford?1:0.5, textAlign:"center" }}>
+                        {ownedCount > 0 && (
+                          <div style={{ position:"absolute", top:6, right:8,
+                                        background:"#f59e0b", color:"#0f172a",
+                                        borderRadius:99, fontSize:9, fontWeight:900,
+                                        padding:"2px 6px", lineHeight:1.4 }}>
+                            ×{ownedCount}
+                          </div>
+                        )}
                         <div style={{ fontSize:11,fontWeight:700,color:"#f1f5f9",marginBottom:4 }}>{reward.label}</div>
                         <div style={{ fontSize:15,fontWeight:900,color:canAfford?"#fbbf24":"#475569" }}>{costLabel}</div>
                       </button>
@@ -851,7 +992,7 @@ function App() {
 
         {/* ── 관리자 탭 ── */}
         {tab==="admin" && adminMode && (
-          <AdminPanel cfg={cfg} setCfg={setCfg} updateCfg={updateCfg} state={state} setState={setState} showToast={showToast} />
+          <AdminPanel cfg={cfg} setCfg={setCfg} updateCfg={updateCfg} state={state} setState={setState} showToast={showToast} KEY={KEY} CFG_KEY={"dw_config_v1"} ghCfg={ghCfg} saveGhCfg={saveGhCfg} syncStatus={syncStatus} syncMsg={syncMsg} />
         )}
       </div>
 
@@ -1199,13 +1340,14 @@ function EventTimeline({ activeEvent, eventTimes }) {
 // ═══════════════════════════════════════════════════════
 // 관리자 패널
 // ═══════════════════════════════════════════════════════
-function AdminPanel({ cfg, setCfg, updateCfg, state, setState, showToast }) {
+function AdminPanel({ cfg, setCfg, updateCfg, state, setState, showToast, KEY, CFG_KEY, ghCfg, saveGhCfg, syncStatus, syncMsg }) {
   const [section, setSection] = useState("quests");
-  const [editingTask, setEditingTask] = useState(null);   // { gKey, tIdx, data }
-  const [editingEvent, setEditingEvent] = useState(null); // { eIdx, data }
-  const [editingReward, setEditingReward] = useState(null); // { tierIdx, rIdx, data }
-  const [editingSkillMission, setEditingSkillMission] = useState(null); // { sKey, lvIdx, mIdx, text }
+  const [editingTask, setEditingTask] = useState(null);
+  const [editingEvent, setEditingEvent] = useState(null);
+  const [editingReward, setEditingReward] = useState(null);
+  const [editingSkillMission, setEditingSkillMission] = useState(null);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [ghForm, setGhForm] = useState({ ...ghCfg });
 
   const INPUT = { background:"#0f172a", border:"1px solid #334155", borderRadius:6,
                   color:"#f1f5f9", padding:"6px 8px", fontSize:12, width:"100%", boxSizing:"border-box" };
@@ -1215,8 +1357,8 @@ function AdminPanel({ cfg, setCfg, updateCfg, state, setState, showToast }) {
     background: section===k?"#dc2626":"#1e293b", color: section===k?"#fff":"#64748b",
   });
 
-  // ── 세션 탭 ──
   const sections = [
+    ["github","☁️ GitHub"],
     ["quests","📅 퀘스트"], ["events","⏰ 이벤트"], ["rewards","🎁 보상"],
     ["skills","🌳 스킬"], ["manual","🎲 수동 조정"], ["reset","⚠️ 초기화"],
   ];
@@ -1230,6 +1372,82 @@ function AdminPanel({ cfg, setCfg, updateCfg, state, setState, showToast }) {
         ))}
       </div>
 
+      {/* ── GitHub 설정 ── */}
+      {section==="github" && (
+        <div>
+          {/* 현재 동기화 상태 */}
+          <div style={{ padding:"10px 12px", borderRadius:10, marginBottom:14,
+                        background: syncStatus==="error"?"#2d0a0a":syncStatus==="ok"?"#0a1a0a":"#0a1a2e",
+                        border:`1px solid ${syncStatus==="error"?"#7f1d1d":syncStatus==="ok"?"#14532d":"#1e3a5f"}` }}>
+            <div style={{ fontSize:12, fontWeight:800,
+                          color: syncStatus==="error"?"#f87171":syncStatus==="ok"?"#34d399":"#60a5fa" }}>
+              {syncStatus==="loading"?"⏳ 불러오는 중...":syncStatus==="saving"?"💾 저장 중...":syncStatus==="error"?"❌ "+syncMsg:syncStatus==="ok"?"✅ "+syncMsg:"⚪ GitHub 미연결"}
+            </div>
+          </div>
+
+          {/* 설정 안내 */}
+          <div style={{ padding:"12px 14px", borderRadius:10, background:"#0d1520",
+                        border:"1px solid #1e293b", marginBottom:14, fontSize:11, color:"#64748b",
+                        lineHeight:1.8 }}>
+            <div style={{ fontWeight:800, color:"#94a3b8", marginBottom:6 }}>📋 설정 방법</div>
+            <div>1. GitHub에서 <span style={{color:"#60a5fa"}}>비공개 저장소</span> 새로 만들기 (예: darkwar-data)</div>
+            <div>2. 저장소에 <span style={{color:"#60a5fa"}}>Issue #1</span> 하나 만들기 (제목은 아무거나)</div>
+            <div>3. GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)</div>
+            <div>4. <span style={{color:"#fbbf24"}}>repo</span> 권한 체크 후 토큰 발급</div>
+            <div>5. 아래에 입력 후 저장</div>
+          </div>
+
+          {/* 입력 폼 */}
+          <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+            <div>
+              <span style={LABEL}>GitHub 사용자명 (owner)</span>
+              <input value={ghForm.owner} onChange={e=>setGhForm(f=>({...f,owner:e.target.value}))}
+                placeholder="예: myusername" style={INPUT} />
+            </div>
+            <div>
+              <span style={LABEL}>데이터 저장소 이름 (repo)</span>
+              <input value={ghForm.repo} onChange={e=>setGhForm(f=>({...f,repo:e.target.value}))}
+                placeholder="예: darkwar-data" style={INPUT} />
+            </div>
+            <div>
+              <span style={LABEL}>Issue 번호</span>
+              <input type="number" value={ghForm.issueNumber} min={1}
+                onChange={e=>setGhForm(f=>({...f,issueNumber:Number(e.target.value)}))}
+                style={{ ...INPUT, width:80 }} />
+            </div>
+            <div>
+              <span style={LABEL}>Personal Access Token 🔑</span>
+              <input type="password" value={ghForm.token}
+                onChange={e=>setGhForm(f=>({...f,token:e.target.value}))}
+                placeholder="ghp_xxxxxxxxxxxx" style={INPUT} />
+              <div style={{ fontSize:9, color:"#475569", marginTop:3 }}>
+                토큰은 이 기기의 localStorage에만 저장돼요. GitHub에 전송되지 않아요.
+              </div>
+            </div>
+            <button onClick={()=>{
+              saveGhCfg(ghForm);
+              showToast("GitHub 설정 저장됨 ✅ 잠시 후 동기화돼요", "success");
+            }} style={{ padding:"11px", borderRadius:9, border:"none",
+                        background:"#2563eb", color:"#fff", cursor:"pointer",
+                        fontWeight:800, fontSize:13 }}>
+              연결하기
+            </button>
+            {ghCfg.token && (
+              <button onClick={()=>{
+                const empty = { token:"", owner:"", repo:"", issueNumber:1 };
+                saveGhCfg(empty);
+                setGhForm(empty);
+                showToast("GitHub 연결 해제됨", "warn");
+              }} style={{ padding:"9px", borderRadius:9, border:"1px solid #334155",
+                          background:"transparent", color:"#94a3b8", cursor:"pointer",
+                          fontWeight:700, fontSize:12 }}>
+                연결 해제
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* ── 퀘스트 편집 ── */}
       {section==="quests" && (
         <div>
@@ -1240,7 +1458,7 @@ function AdminPanel({ cfg, setCfg, updateCfg, state, setState, showToast }) {
             <div key={gKey} style={{ marginBottom:16, background:"#0d1520", borderRadius:10,
                                      padding:"12px", border:`1px solid ${group.color}40` }}>
               {/* 카테고리 헤더 편집 */}
-              <div style={{ display:"flex", gap:8, alignItems:"center", marginBottom:10 }}>
+              <div style={{ display:"flex", gap:8, alignItems:"center", marginBottom:8 }}>
                 <span style={{ fontSize:16 }}>{group.icon}</span>
                 <span style={{ fontWeight:800, color:"#f1f5f9", fontSize:13, flex:1 }}>{group.label}</span>
                 <div style={{ display:"flex", alignItems:"center", gap:6 }}>
@@ -1249,6 +1467,34 @@ function AdminPanel({ cfg, setCfg, updateCfg, state, setState, showToast }) {
                     onChange={e=>updateCfg(`questGroups.${gKey}.bonusPts`, Number(e.target.value))}
                     style={{ ...INPUT, width:48, textAlign:"center" }} />
                   <span style={{ fontSize:10, color:"#64748b" }}>P</span>
+                </div>
+              </div>
+
+              {/* 이벤트 배정 토글 */}
+              <div style={{ marginBottom:10, padding:"8px 10px", background:"#0f172a",
+                            borderRadius:8, border:"1px solid #1e293b" }}>
+                <div style={{ fontSize:10, color:"#64748b", marginBottom:6, fontWeight:700 }}>
+                  ⏰ 적용할 이벤트 선택
+                </div>
+                <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                  {cfg.eventTimes.map(ev => {
+                    const allowed = group.allowedEvents || [];
+                    const isOn = allowed.includes(ev.id);
+                    return (
+                      <button key={ev.id} onClick={()=>{
+                        const cur = group.allowedEvents || [];
+                        const next = isOn ? cur.filter(x=>x!==ev.id) : [...cur, ev.id];
+                        updateCfg(`questGroups.${gKey}.allowedEvents`, next);
+                      }} style={{
+                        padding:"4px 10px", borderRadius:99, border:"none", cursor:"pointer",
+                        fontSize:10, fontWeight:700,
+                        background: isOn ? "linear-gradient(90deg,#7c3aed,#2563eb)" : "#1e293b",
+                        color: isOn ? "#fde68a" : "#475569",
+                      }}>
+                        {ev.icon} {ev.label} ×{ev.mult}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
               {/* 태스크 목록 */}
@@ -1574,6 +1820,87 @@ function AdminPanel({ cfg, setCfg, updateCfg, state, setState, showToast }) {
       {/* ── 초기화 ── */}
       {section==="reset" && (
         <div style={{ padding:"16px 0" }}>
+
+          {/* ── 백업 내보내기 ── */}
+          <div style={{ background:"#0d1a2e", borderRadius:12, padding:16,
+                        border:"1px solid #1e3a5f", marginBottom:12 }}>
+            <div style={{ fontSize:13, fontWeight:800, color:"#60a5fa", marginBottom:6 }}>
+              📤 데이터 백업 (내보내기)
+            </div>
+            <div style={{ fontSize:11, color:"#64748b", marginBottom:12 }}>
+              현재 진행 데이터와 설정을 JSON 파일로 저장해요.<br/>
+              iOS Safari 7일 삭제 정책에 대비해 주기적으로 저장해두세요.
+            </div>
+            <button onClick={()=>{
+              const backup = {
+                version: 1,
+                exportedAt: new Date().toISOString(),
+                state: state,
+                cfg: cfg,
+              };
+              const json = JSON.stringify(backup, null, 2);
+              const blob = new Blob([json], { type:"application/json" });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              const dateStr = new Date().toISOString().slice(0,10);
+              a.href = url;
+              a.download = `darkwar-backup-${dateStr}.json`;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+              showToast("백업 파일이 저장됐어요 📤", "success");
+            }} style={{ padding:"10px 20px", borderRadius:9, border:"none",
+                        background:"#2563eb", color:"#fff", cursor:"pointer",
+                        fontWeight:800, fontSize:13 }}>
+              💾 백업 파일 다운로드
+            </button>
+          </div>
+
+          {/* ── 백업 복원 ── */}
+          <div style={{ background:"#0d1a2e", borderRadius:12, padding:16,
+                        border:"1px solid #1e3a5f", marginBottom:12 }}>
+            <div style={{ fontSize:13, fontWeight:800, color:"#34d399", marginBottom:6 }}>
+              📥 데이터 복원 (가져오기)
+            </div>
+            <div style={{ fontSize:11, color:"#64748b", marginBottom:12 }}>
+              이전에 저장한 백업 JSON 파일을 불러와서 데이터를 복원해요.
+            </div>
+            <label style={{ display:"inline-block", padding:"10px 20px", borderRadius:9,
+                            background:"#059669", color:"#fff", cursor:"pointer",
+                            fontWeight:800, fontSize:13 }}>
+              📂 백업 파일 불러오기
+              <input type="file" accept=".json" style={{ display:"none" }}
+                onChange={e=>{
+                  const file = e.target.files[0];
+                  if (!file) return;
+                  const reader = new FileReader();
+                  reader.onload = ev => {
+                    try {
+                      const backup = JSON.parse(ev.target.result);
+                      if (!backup.version || !backup.state) {
+                        showToast("올바른 백업 파일이 아니에요 ❌", "error");
+                        return;
+                      }
+                      if (backup.state) {
+                        setState(backup.state);
+                        try { localStorage.setItem(KEY, JSON.stringify(backup.state)); } catch{}
+                      }
+                      if (backup.cfg) {
+                        setCfg(backup.cfg);
+                        try { localStorage.setItem(CFG_KEY, JSON.stringify(backup.cfg)); } catch{}
+                      }
+                      showToast("데이터가 복원됐어요 ✅", "success");
+                    } catch(err) {
+                      showToast("파일을 읽을 수 없어요 ❌", "error");
+                    }
+                  };
+                  reader.readAsText(file);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+          </div>
           <div style={{ background:"#2d0a0a", borderRadius:12, padding:16, border:"1px solid #7f1d1d", marginBottom:12 }}>
             <div style={{ fontSize:13, fontWeight:800, color:"#f87171", marginBottom:6 }}>⚠️ 진행 데이터 초기화</div>
             <div style={{ fontSize:11, color:"#94a3b8", marginBottom:12 }}>
@@ -1592,7 +1919,8 @@ function AdminPanel({ cfg, setCfg, updateCfg, state, setState, showToast }) {
                     setState({
                       points:0, resources:{energy:0,knowledge:0,talent:0},
                       completedByDay:{}, skillLevels:{}, skillProgress:{},
-                      weeklySkillUps:{}, upgrades:{}, weeklyBoosts:{}, totalPts:0, history:[],
+                      weeklySkillUps:{}, upgrades:{}, weeklyBoosts:{},
+                      totalPts:0, history:[], rewardInventory:{},
                     });
                     setConfirmReset(false);
                     showToast("진행 데이터가 초기화됐어요","warn");
