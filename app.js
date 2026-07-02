@@ -215,6 +215,68 @@ const REWARD_TIERS = [
   },
 ];
 
+// ── 일일 보상 게이지 설정 ──────────────────────────────
+const DAILY_REWARD_TIERS = [
+  {
+    tier: 1,
+    label: "1단계",
+    requiredPts: 30,
+    color: "#94a3b8",
+    glow: "#64748b",
+    mult: 1,
+    items: [
+      { id:"r_yt30",    label:"유튜브 30분",       icon:"📺" },
+      { id:"r_game30",  label:"컴퓨터 게임 30분",  icon:"💻" },
+      { id:"r_nd30",    label:"닌텐도 30분",        icon:"🎮" },
+      { id:"r_entv30",  label:"영어 TV 30분",       icon:"🇺🇸" },
+      { id:"r_krtv30",  label:"한국어 TV 30분",     icon:"📡" },
+      { id:"r_board",   label:"보드게임 1판",       icon:"🎲" },
+    ],
+  },
+  {
+    tier: 2,
+    label: "2단계",
+    requiredPts: 70,
+    color: "#fbbf24",
+    glow: "#f59e0b",
+    mult: 2,
+    items: [
+      { id:"r_yt30",    label:"유튜브 30분",       icon:"📺" },
+      { id:"r_game30",  label:"컴퓨터 게임 30분",  icon:"💻" },
+      { id:"r_nd30",    label:"닌텐도 30분",        icon:"🎮" },
+      { id:"r_entv30",  label:"영어 TV 30분",       icon:"🇺🇸" },
+      { id:"r_krtv30",  label:"한국어 TV 30분",     icon:"📡" },
+      { id:"r_board",   label:"보드게임 1판",       icon:"🎲" },
+    ],
+  },
+  {
+    tier: 3,
+    label: "3단계",
+    requiredPts: 120,
+    color: "#f97316",
+    glow: "#ea580c",
+    mult: 3,
+    items: [
+      { id:"r_yt30",    label:"유튜브 30분",       icon:"📺" },
+      { id:"r_game30",  label:"컴퓨터 게임 30분",  icon:"💻" },
+      { id:"r_nd30",    label:"닌텐도 30분",        icon:"🎮" },
+      { id:"r_entv30",  label:"영어 TV 30분",       icon:"🇺🇸" },
+      { id:"r_krtv30",  label:"한국어 TV 30분",     icon:"📡" },
+      { id:"r_board",   label:"보드게임 1판",       icon:"🎲" },
+    ],
+  },
+];
+
+// 랜덤 3개 뽑기 (중복 허용)
+function pickRandomRewards(tierItems, count) {
+  const picks = [];
+  for (let i = 0; i < count; i++) {
+    picks.push(tierItems[Math.floor(Math.random() * tierItems.length)]);
+  }
+  return picks;
+}
+
+
 // ── 업그레이드 (자원 소비) ─────────────────────────────
 const UPGRADES = {
   rewards: [
@@ -295,6 +357,10 @@ function initState() {
     totalPts: 0,
     history: [],
     rewardInventory: {},
+    dailyGaugePts: 0,           // 오늘의 게이지 포인트 (매일 리셋)
+    dailyGaugeDate: "",         // 마지막 게이지 날짜
+    dailyTiersCleared: [],      // 오늘 클리어한 단계 [1,2,3]
+    inventory: {},              // { "r_yt30": 3, "r_game30": 1 }
   };
 }
 
@@ -439,6 +505,22 @@ function App() {
     return best;
   }
   const activeEvent = getActiveEventFromCfg();
+  // ── 날짜 자동 갱신 ──
+  useEffect(() => {
+    const lastDate = state.dailyGaugeDate || state.lastActiveDate || "";
+    if (lastDate && lastDate !== today) {
+      // 날짜가 바뀌었으면 일일 게이지 리셋
+      setState(s => ({
+        ...s,
+        dailyGaugePts: 0,
+        dailyGaugeDate: today,
+        dailyTiersCleared: [],
+        lastActiveDate: today,
+      }));
+    } else if (!lastDate) {
+      setState(s => ({ ...s, lastActiveDate: today }));
+    }
+  }, [today]);
   const completed = state.completedByDay[today] || [];
 
   function showToast(msg, type="success") {
@@ -484,18 +566,72 @@ function App() {
       }
     }
 
-    setState(s => ({
-      ...s,
-      points: Math.max(0, s.points + diff + bonusPts),
-      totalPts: Math.max(0, s.totalPts + diff + bonusPts),
-      resources: {
+        setState(s => {
+      // ── 기존 포인트/자원 처리 ──
+      const newPoints = Math.max(0, s.points + diff + bonusPts);
+      const newTotalPts = Math.max(0, s.totalPts + diff + bonusPts);
+      const newResources = {
         ...s.resources,
         [resource]: Math.max(0, (s.resources[resource]||0) + resDiff + bonusRes),
-      },
-      completedByDay: { ...s.completedByDay, [today]: newCompleted },
-      history: already ? s.history : [...s.history,
-        { date:today, taskId, pts:earnedPts, res:earnedRes, resource, mult }],
-    }));
+      };
+      const newCompleted2 = already
+        ? completed.filter(x => x !== taskId)
+        : [...completed, taskId];
+
+      // ── 일일 게이지 처리 ──
+      const gaugeDate = s.dailyGaugeDate || "";
+      const isNewDay = gaugeDate !== today;
+      const prevGaugePts = isNewDay ? 0 : (s.dailyGaugePts || 0);
+      const prevCleared = isNewDay ? [] : (s.dailyTiersCleared || []);
+
+      const earnedGauge = already ? 0 : Math.round(pts * mult);
+      const newGaugePts = already
+        ? Math.max(0, prevGaugePts - pts)
+        : prevGaugePts + earnedGauge;
+
+      // 새로 클리어된 단계 확인 + 인벤토리에 보상 추가
+      let newInventory = { ...(s.inventory||{}) };
+      let newCleared = [...prevCleared];
+      let newlyCleared = [];
+
+      DAILY_REWARD_TIERS.forEach(tier => {
+        const wasCleared = prevCleared.includes(tier.tier);
+        const nowCleared = newGaugePts >= tier.requiredPts;
+        if (!wasCleared && nowCleared) {
+          newCleared.push(tier.tier);
+          newlyCleared.push(tier);
+          // 랜덤 보상 3개 × 단계 배수 뽑아서 인벤토리에 추가
+          const picks = pickRandomRewards(tier.items, 3 * tier.mult);
+          picks.forEach(item => {
+            newInventory[item.id] = (newInventory[item.id]||0) + 1;
+          });
+        }
+      });
+
+      // 클리어 알림 (타임아웃으로 토스트)
+      if (newlyCleared.length > 0) {
+        newlyCleared.forEach(tier => {
+          setTimeout(() => showToast(
+            `🎉 ${tier.label} 달성! 보상 ${3*tier.mult}개 획득!`, "bonus"
+          ), 400);
+        });
+      }
+
+      return {
+        ...s,
+        points: newPoints,
+        totalPts: newTotalPts,
+        resources: newResources,
+        completedByDay: { ...s.completedByDay, [today]: newCompleted2 },
+        history: already ? s.history : [...s.history,
+          { date:today, taskId, pts:earnedPts, res:earnedRes, resource, mult }],
+        dailyGaugePts: newGaugePts,
+        dailyGaugeDate: today,
+        dailyTiersCleared: newCleared,
+        inventory: newInventory,
+      };
+    });
+
 
     if (!already) showToast(`+${earnedPts}P  +${earnedRes}${RESOURCE_TYPES[resource].icon}${mult>1? ` ×${mult}!`:""}`, "success");
   }
@@ -656,6 +792,7 @@ function App() {
             ["daily","📅 오늘"],
             ["skills","🌳 스킬"],
             ["reward","🎁 보상"],
+            ["bag","🎒 주머니"],
             ["upgrade","⚙️ 업그레이드"],
             ...(adminMode ? [["admin","🔧 관리자"]] : []),
           ].map(([k,l])=>(
@@ -868,63 +1005,15 @@ function App() {
 
         {/* ── 보상 탭 ── */}
         {tab==="reward" && (
-          <div>
-            {cfg.rewardTiers.map(tier=>(
-              <div key={tier.tier} style={{ marginTop:14 }}>
-                <div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:8 }}>
-                  <span style={{ fontSize:18 }}>{tier.icon}</span>
-                  <span style={{ fontWeight:800,color:tier.color,fontSize:14 }}>{tier.label}</span>
-                  <span style={{ fontSize:11,color:"#64748b" }}>{tier.desc}</span>
-                </div>
-                <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:8 }}>
-                  {tier.rewards.map(reward=>{
-                    let canAfford = false;
-                    let costLabel = "";
-                    if (tier.tier < 3) {
-                      canAfford = state.points >= reward.pts;
-                      costLabel = `${reward.pts}P`;
-                    } else {
-                      canAfford = Object.entries(reward.res).every(([r,v])=>(state.resources[r]||0)>=v);
-                      costLabel = Object.entries(reward.res)
-                        .filter(([,v])=>v>0)
-                        .map(([r,v])=>`${RESOURCE_TYPES[r].icon}${v}`).join(" ");
-                    }
-                    const ownedCount = (state.rewardInventory||{})[reward.id] || 0;
-                    return (
-                      <button key={reward.id} onClick={()=>redeemReward(reward,tier.tier)}
-                        style={{ padding:"14px 10px",borderRadius:12, position:"relative",
-                                 border:`1px solid ${canAfford?tier.color+"70":"#1e293b"}`,
-                                 background:canAfford?tier.color+"12":"#131e30",
-                                 cursor:canAfford?"pointer":"not-allowed",
-                                 opacity:canAfford?1:0.5, textAlign:"center" }}>
-                        {ownedCount > 0 && (
-                          <div style={{ position:"absolute", top:6, right:8,
-                                        background:"#f59e0b", color:"#0f172a",
-                                        borderRadius:99, fontSize:9, fontWeight:900,
-                                        padding:"2px 6px", lineHeight:1.4 }}>
-                            ×{ownedCount}
-                          </div>
-                        )}
-                        <div style={{ fontSize:11,fontWeight:700,color:"#f1f5f9",marginBottom:4 }}>{reward.label}</div>
-                        <div style={{ fontSize:15,fontWeight:900,color:canAfford?"#fbbf24":"#475569" }}>{costLabel}</div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
+          <div style={{ paddingBottom:80 }}>
+            <DailyRewardGauge state={state} today={today} />
+          </div>
+        )}
 
-            {/* 현재 보유 */}
-            <div style={{ marginTop:16,padding:"12px 14px",background:"#131e30",
-                          borderRadius:12,border:"1px solid #1e293b" }}>
-              <div style={{ fontSize:12,color:"#94a3b8",marginBottom:6 }}>현재 보유</div>
-              <div style={{ display:"flex",gap:16 }}>
-                <div><span style={{ fontSize:22,fontWeight:900,color:"#fbbf24" }}>{state.points}</span><span style={{ fontSize:11,color:"#94a3b8" }}>P</span></div>
-                {Object.values(RESOURCE_TYPES).map(r=>(
-                  <div key={r.id}><span style={{ fontSize:16,fontWeight:800,color:r.color }}>{state.resources[r.id]||0}</span><span style={{ fontSize:14 }}>{r.icon}</span></div>
-                ))}
-              </div>
-            </div>
+        {/* ── 주머니(인벤토리) 탭 ── */}
+        {tab==="bag" && (
+          <div style={{ paddingBottom:80 }}>
+            <InventoryPanel state={state} setState={setState} showToast={showToast} />
           </div>
         )}
 
@@ -2013,3 +2102,280 @@ function ManualAdjust({ state, setState, showToast }) {
 
 
 ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+
+// ── 일일 보상 게이지 컴포넌트 ─────────────────────────
+function DailyRewardGauge({ state, today }) {
+  const isNewDay = (state.dailyGaugeDate || "") !== today;
+  const gaugePts = isNewDay ? 0 : (state.dailyGaugePts || 0);
+  const cleared  = isNewDay ? [] : (state.dailyTiersCleared || []);
+  const maxPts   = DAILY_REWARD_TIERS[DAILY_REWARD_TIERS.length - 1].requiredPts;
+  const pct      = Math.min(100, Math.round(gaugePts / maxPts * 100));
+
+  return (
+    <div style={{ paddingTop:12 }}>
+      {/* 오늘 포인트 요약 */}
+      <div style={{ display:"flex", justifyContent:"space-between",
+                    alignItems:"center", marginBottom:14 }}>
+        <div>
+          <div style={{ fontSize:11, color:"#64748b" }}>오늘 보상 게이지</div>
+          <div style={{ fontSize:26, fontWeight:900, color:"#fbbf24", lineHeight:1 }}>
+            {gaugePts}<span style={{ fontSize:13, color:"#f59e0b" }}>P</span>
+          </div>
+        </div>
+        <div style={{ textAlign:"right", fontSize:11, color:"#64748b" }}>
+          <div>매일 자정 초기화</div>
+          <div style={{ color:"#34d399" }}>
+            {cleared.length}/3단계 달성
+          </div>
+        </div>
+      </div>
+
+      {/* 통합 게이지 바 */}
+      <div style={{ position:"relative", marginBottom:20 }}>
+        {/* 배경 */}
+        <div style={{ height:28, borderRadius:99, background:"#1e293b",
+                      overflow:"hidden", position:"relative" }}>
+          {/* 채워진 바 */}
+          <div style={{
+            position:"absolute", left:0, top:0, bottom:0,
+            width:`${pct}%`,
+            background: gaugePts >= 120
+              ? "linear-gradient(90deg,#94a3b8,#fbbf24,#f97316)"
+              : gaugePts >= 70
+              ? "linear-gradient(90deg,#94a3b8,#fbbf24)"
+              : "linear-gradient(90deg,#64748b,#94a3b8)",
+            borderRadius:99,
+            transition:"width 0.6s ease",
+            boxShadow: gaugePts >= 30 ? "0 0 12px #94a3b888" : "none",
+          }}/>
+          {/* 단계 구분선 */}
+          {DAILY_REWARD_TIERS.map(tier => (
+            <div key={tier.tier} style={{
+              position:"absolute", top:0, bottom:0,
+              left:`${Math.round(tier.requiredPts/maxPts*100)}%`,
+              width:2, background:"#080f1a", opacity:0.6,
+            }}/>
+          ))}
+        </div>
+        {/* 단계 마커 */}
+        {DAILY_REWARD_TIERS.map(tier => {
+          const markerPct = Math.round(tier.requiredPts / maxPts * 100);
+          const isCleared = cleared.includes(tier.tier);
+          return (
+            <div key={tier.tier} style={{
+              position:"absolute", top:-8,
+              left:`${markerPct}%`, transform:"translateX(-50%)",
+              textAlign:"center",
+            }}>
+              <div style={{
+                width:22, height:22, borderRadius:99,
+                background: isCleared ? tier.color : "#1e293b",
+                border:`2px solid ${tier.color}`,
+                display:"flex", alignItems:"center", justifyContent:"center",
+                fontSize:10, fontWeight:900,
+                color: isCleared ? "#0f172a" : tier.color,
+                boxShadow: isCleared ? `0 0 10px ${tier.glow}` : "none",
+              }}>
+                {isCleared ? "✓" : tier.tier}
+              </div>
+            </div>
+          );
+        })}
+        {/* 단계 라벨 */}
+        <div style={{ display:"flex", justifyContent:"space-between",
+                      marginTop:18, paddingLeft:0 }}>
+          {DAILY_REWARD_TIERS.map(tier => (
+            <div key={tier.tier} style={{
+              flex:1, textAlign:"center", fontSize:10,
+              color: cleared.includes(tier.tier) ? tier.color : "#475569",
+              fontWeight: cleared.includes(tier.tier) ? 800 : 400,
+            }}>
+              {tier.label} {tier.requiredPts}P
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* 단계별 보상 카드 */}
+      {DAILY_REWARD_TIERS.map(tier => {
+        const isCleared = cleared.includes(tier.tier);
+        const prevTier = DAILY_REWARD_TIERS.find(t => t.tier === tier.tier - 1);
+        const prevPts = prevTier ? prevTier.requiredPts : 0;
+        const segPct = tier.tier === 1
+          ? Math.min(100, Math.round(gaugePts / tier.requiredPts * 100))
+          : Math.min(100, Math.max(0, Math.round(
+              (gaugePts - prevPts) / (tier.requiredPts - prevPts) * 100
+            )));
+
+        return (
+          <div key={tier.tier} style={{
+            marginBottom:12, padding:"14px 14px",
+            borderRadius:12,
+            border:`1px solid ${isCleared ? tier.color : "#1e293b"}`,
+            background: isCleared ? tier.color+"12" : "#0d1520",
+          }}>
+            <div style={{ display:"flex", alignItems:"center",
+                          gap:10, marginBottom:10 }}>
+              <div style={{
+                width:28, height:28, borderRadius:99,
+                background: isCleared ? tier.color : "#1e293b",
+                border:`2px solid ${tier.color}`,
+                display:"flex", alignItems:"center", justifyContent:"center",
+                fontSize:12, fontWeight:900,
+                color: isCleared ? "#0f172a" : tier.color,
+                flexShrink:0,
+              }}>
+                {isCleared ? "✓" : tier.tier}
+              </div>
+              <div style={{ flex:1 }}>
+                <div style={{ fontWeight:800, fontSize:13,
+                              color: isCleared ? tier.color : "#f1f5f9" }}>
+                  {tier.label} 보상
+                  {isCleared && " — 달성! 🎉"}
+                </div>
+                <div style={{ fontSize:10, color:"#64748b" }}>
+                  {tier.requiredPts}P 달성 시 랜덤 보상 {3 * tier.mult}개 획득
+                </div>
+              </div>
+              <div style={{ fontSize:12, fontWeight:800,
+                            color: isCleared ? tier.color : "#475569" }}>
+                {isCleared ? `+${3*tier.mult}개` : `${segPct}%`}
+              </div>
+            </div>
+
+            {/* 세그먼트 게이지 */}
+            {!isCleared && (
+              <div style={{ background:"#1e293b", borderRadius:99,
+                            height:6, overflow:"hidden", marginBottom:8 }}>
+                <div style={{
+                  width:`${segPct}%`, height:"100%",
+                  background:`linear-gradient(90deg,${tier.glow},${tier.color})`,
+                  borderRadius:99, transition:"width 0.5s ease",
+                }}/>
+              </div>
+            )}
+
+            {/* 보상 아이템 미리보기 */}
+            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+              {tier.items.map(item => (
+                <div key={item.id} style={{
+                  padding:"3px 8px", borderRadius:99, fontSize:10,
+                  background:"#1e293b",
+                  color: isCleared ? tier.color : "#64748b",
+                  border:`1px solid ${isCleared ? tier.color+"40" : "#334155"}`,
+                }}>
+                  {item.icon} {item.label}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+
+      <div style={{ textAlign:"center", fontSize:10, color:"#334155", marginTop:8 }}>
+        💡 오늘의 퀘스트를 완료하면 게이지가 올라가요
+      </div>
+    </div>
+  );
+}
+
+// ── 주머니(인벤토리) 컴포넌트 ────────────────────────────
+function InventoryPanel({ state, setState, showToast }) {
+  const inventory = state.inventory || {};
+
+  // 모든 아이템 목록 (중복 제거)
+  const allItems = [];
+  const seen = new Set();
+  DAILY_REWARD_TIERS.forEach(tier => {
+    tier.items.forEach(item => {
+      if (!seen.has(item.id)) {
+        seen.add(item.id);
+        allItems.push(item);
+      }
+    });
+  });
+
+  const totalCount = Object.values(inventory).reduce((s,v)=>s+v,0);
+
+  function useItem(itemId, label) {
+    const count = inventory[itemId] || 0;
+    if (count <= 0) return;
+    setState(s => ({
+      ...s,
+      inventory: { ...s.inventory, [itemId]: Math.max(0, (s.inventory[itemId]||0) - 1) },
+    }));
+    showToast(`✅ ${label} 사용됨!`, "special");
+  }
+
+  return (
+    <div style={{ paddingTop:12 }}>
+      <div style={{ display:"flex", justifyContent:"space-between",
+                    alignItems:"center", marginBottom:14 }}>
+        <div>
+          <div style={{ fontSize:14, fontWeight:800, color:"#f1f5f9" }}>
+            🎒 보상 주머니
+          </div>
+          <div style={{ fontSize:11, color:"#64748b" }}>
+            보상 게이지를 채우면 여기에 아이템이 쌓여요
+          </div>
+        </div>
+        <div style={{ textAlign:"right" }}>
+          <div style={{ fontSize:10, color:"#64748b" }}>총 보유</div>
+          <div style={{ fontSize:22, fontWeight:900, color:"#fbbf24" }}>
+            {totalCount}<span style={{ fontSize:11, color:"#f59e0b" }}>개</span>
+          </div>
+        </div>
+      </div>
+
+      {totalCount === 0 ? (
+        <div style={{ textAlign:"center", padding:"40px 20px",
+                      color:"#334155", fontSize:13 }}>
+          <div style={{ fontSize:40, marginBottom:12 }}>🎒</div>
+          <div>아직 아이템이 없어요</div>
+          <div style={{ fontSize:11, marginTop:6 }}>
+            보상 탭에서 게이지를 채워보세요!
+          </div>
+        </div>
+      ) : (
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+          {allItems.map(item => {
+            const count = inventory[item.id] || 0;
+            if (count === 0) return null;
+            return (
+              <div key={item.id} style={{
+                padding:"14px 12px", borderRadius:12,
+                background:"#0d1520",
+                border:"1px solid #1e293b",
+                textAlign:"center",
+                position:"relative",
+              }}>
+                {/* 수량 뱃지 */}
+                <div style={{
+                  position:"absolute", top:8, right:8,
+                  background:"#f59e0b", color:"#0f172a",
+                  borderRadius:99, fontSize:9, fontWeight:900,
+                  padding:"2px 7px", lineHeight:1.5,
+                }}>
+                  ×{count}
+                </div>
+                <div style={{ fontSize:30, marginBottom:6 }}>{item.icon}</div>
+                <div style={{ fontSize:11, fontWeight:700,
+                              color:"#f1f5f9", marginBottom:10 }}>
+                  {item.label}
+                </div>
+                <button onClick={()=>useItem(item.id, item.label)}
+                  style={{
+                    padding:"6px 14px", borderRadius:99, border:"none",
+                    background:"#f59e0b", color:"#0f172a",
+                    cursor:"pointer", fontSize:11, fontWeight:800,
+                  }}>
+                  사용하기
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
